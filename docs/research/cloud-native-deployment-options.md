@@ -10,6 +10,14 @@ This note surveys deployment options for TuFT beyond the two existing backends
 
 It ends with a concrete recommendation for the next step.
 
+**TL;DR.** Kubernetes is the only substrate that covers all four clouds with a
+single integration — the multi-cloud launchers (SkyPilot, dstack) both skip
+Alibaba Cloud, and nearly all managed AI platforms are structural mismatches
+for a stateful server (the one exception: Alibaba PAI-EAS). Recommended next
+step: **ship a Helm chart (`deploy/kubernetes/`) validated end-to-end on one
+managed cluster**, then thin per-cloud guides (ACK/EKS/GKE/AKS), then a
+SkyPilot helper for the no-cluster VM path. Details in §8–9.
+
 ## 1. Where we are today
 
 TuFT ships two deploy helpers, both thin wrappers around the same standard
@@ -215,7 +223,52 @@ Ray — and doesn't manage services/volumes/ports as a product. Poor fit.
 Lambda, RunPod, Nebius, …) in one shot, but **Alibaba Cloud is reachable only
 through the Kubernetes backend (i.e., ACK)** or a bespoke integration.
 
-<!-- TODO: section 6 — per-cloud native options (agent C) -->
+## 6. Option C — Native per-cloud paths (outside Kubernetes)
+
+Verified state per cloud (2026-07-18). Two sub-options each: the plain
+**GPU VM + cloud-init** path (parity with the existing Lambda helper) and the
+cloud's **managed AI platforms**.
+
+### The VM path works everywhere — but costs 4× maintenance
+
+All four clouds expose an API-drivable "launch instance with user-data" flow,
+so `deploy/lambda/launch.py` could be ported almost mechanically:
+
+| Cloud | API | user-data | Single-GPU instance families |
+|---|---|---|---|
+| AWS | EC2 `RunInstances` (boto3) | cloud-init | g6e (L40S), p4d (A100), p5 (H100); [Capacity Blocks](https://aws.amazon.com/ec2/capacityblocks/) reserve scarce H100/H200 and run the same user-data |
+| GCP | `instances.insert` | `startup-script` metadata | G2 (L4), A2 (A100), A3 (H100/H200), A4 (B200) |
+| Azure | `Microsoft.Compute/virtualMachines` | cloud-init (`customData`) | NC_A100_v4, NCads_H100_v5 (H100 NVL 94 GB — best single-GPU fit) |
+| Alibaba | ECS `RunInstances` (`UserData` param, [docs](https://www.alibabacloud.com/help/en/ecs/user-guide/manage-the-user-data-of-linux-instances)) | cloud-init | gn7e (A100 80 GB), gn8is (L20), gn8v (H20) |
+
+Four more `launch.py` scripts would each need auth, instance-type discovery,
+capacity fallback, teardown verbs, docs, and E2E CI — the maintenance profile
+that multi-cloud launchers (§5) and Kubernetes (§4) exist to avoid.
+
+### Managed AI platforms: almost all structural mismatches
+
+TuFT is a long-running stateful server with its own multi-route API and its
+own auth — which breaks nearly every managed inference/training product:
+
+| Platform | Verdict | Reason |
+|---|---|---|
+| SageMaker real-time endpoints | ❌ | fixed contract: port 8080, only `/invocations` + `/ping`, ~60 s response timeout ([docs](https://docs.aws.amazon.com/sagemaker/latest/dg/your-algorithms-inference-code.html)) |
+| SageMaker Training / PAI-DLC / Vertex custom training | ❌ | batch-job semantics, no inbound HTTP — TuFT is not a job |
+| SageMaker HyperPod | ⚠️ | resilient GPU clusters, but orchestration is Slurm or **EKS** — i.e., it merges into the K8s path |
+| Vertex AI prediction (custom container) | ❌ | single `predictRoute`/`healthRoute`, stateless autoscaled replicas ([docs](https://docs.cloud.google.com/vertex-ai/docs/predictions/use-custom-container)) |
+| Cloud Run GPU | ❌ | GA with scale-to-zero, but L4 / RTX PRO 6000 only (no A100/H100) and ephemeral instances ([docs](https://docs.cloud.google.com/run/docs/configuring/services/gpu)) |
+| Azure ML online endpoints | ❌ | scoring-route model, `request_timeout_ms` ≤ 180 s |
+| Azure Container Instances GPU | ❌ | **retired July 2025** ([docs](https://learn.microsoft.com/en-us/azure/container-instances/container-instances-gpu)); successor Azure Container Apps serverless GPU is scale-to-zero/stateless-shaped |
+| ECS on EC2 GPU | ⚠️ | workable long-running service middle ground (Fargate still has no GPUs), but AWS-only — inferior to EKS for us |
+| **Alibaba PAI-EAS** | ✅ | **the one genuine fit**: deploys an arbitrary custom-image GPU HTTP service (your image, command, port), fronted by EAS auth/gateway, with OSS/NAS mounted into the container for `/data` ([custom-image deploy](https://www.alibabacloud.com/help/en/pai/user-guide/deploy-a-model-service-by-using-a-custom-image)) |
+| Alibaba Function Compute GPU | ⚠️ | closest Alibaba Modal-analog (scale-to-zero via instance freezing) but T4/A10/L20 only (≤48 GB) and freezing pauses background work ([docs](https://www.alibabacloud.com/help/en/functioncompute/fc/user-guide/real-time-inference-scenarios-1)) |
+
+**Takeaway:** don't chase the managed inference platforms — they fail on fixed
+route contracts, short timeouts, and statelessness. The two per-cloud things
+worth doing eventually are a **PAI-EAS guide** (best managed fit anywhere in
+this survey, and squarely aimed at the China audience) and, only if demand
+shows up, VM scripts — which SkyPilot/dstack mostly obsolete outside Alibaba.
+
 ## 7. The rest of the GPU-cloud landscape (secondary)
 
 Not roadmap targets, but users keep asking for "the Modal/Lambda of X".
@@ -245,5 +298,112 @@ so one launcher integration reaches nearly all of these without TuFT owning
 any per-provider code. Only Beam (Modal-pattern) and RunPod Pods would justify
 small dedicated helpers if user demand shows up; Hyperstack/OVHcloud are
 covered by neither launcher and are not worth bespoke scripts today.
-<!-- TODO: section 8 — comparison + recommendation -->
-<!-- TODO: section 9 — proposed next step, PR scope, open questions -->
+
+## 8. Comparison and recommendation
+
+| Option | Roadmap coverage | Fit for TuFT's contract | Code we own | Cost model for users |
+|---|---|---|---|---|
+| **Helm chart (K8s)** | **AWS + GCP + Azure + Alibaba + on-prem** — the only single artifact covering all four | Excellent — maps to standard primitives; foundation for multi-node (KubeRay), observability (Prometheus/OTel), GPU sharing | 1 chart + thin per-cloud guides | pay for node pool; scale node pool to 0 manually/autoscaler |
+| SkyPilot helper | AWS + GCP + Azure + Lambda + ~10 more; **no Alibaba** | Good (VM path); Ray caveat manageable; volumes weak on VMs | 1 YAML + thin wrapper | autostop (idle → stop) |
+| dstack helper | similar to SkyPilot; **no Alibaba**; volumes missing on Azure/Lambda | Good (`type: service` maps 1:1) | 1 config | scale-to-zero via gateway |
+| 4× per-cloud VM scripts | all four, one at a time | Good | 4 full launch.py scripts + CI + docs | terminate manually |
+| PAI-EAS guide | Alibaba only | Good (only genuine managed fit) | ~0 (docs only) | managed, per-instance |
+| Managed inference platforms (SageMaker/Vertex/Azure ML endpoints) | — | ❌ structural mismatch — do not pursue | — | — |
+| Serverless GPU (Cloud Run, ACA, Function Compute) | — | ❌ GPU class + statelessness | — | — |
+
+**Recommendation: Kubernetes first.** Three reasons:
+
+1. **It is the only move that satisfies the roadmap sentence with one
+   integration** — including Alibaba Cloud, which SkyPilot and dstack both
+   skip. A Helm chart plus four short "create a GPU node pool on
+   EKS/GKE/AKS/ACK, then `helm install`" guides covers everything.
+2. **Every other near-term roadmap item lands on it.** Multi-node training
+   (KubeRay), observability (Prometheus/Grafana/OTel collectors are
+   K8s-native), and multi-tenant GPU sharing (MIG/time-slicing/cGPU) all
+   assume a cluster substrate. The chart is the foundation, not a detour.
+3. **It matches the stated positioning** — "sits above the infrastructure
+   layer (Kubernetes, cloud platforms, GPU clusters)" — and meets enterprise
+   users where they already are: existing GPU clusters.
+
+SkyPilot remains the right **second** step: it adds the "I don't have a
+cluster, just rent me a VM" path on AWS/GCP/Azure (+ Lambda, RunPod, Nebius, …)
+with one YAML, replacing the need for per-cloud VM scripts. Keeping both paths
+mirrors today's split: Helm ≈ the infrastructure path, SkyPilot ≈ the
+rent-a-GPU path (as Modal/Lambda are today).
+
+## 9. Proposed next step
+
+**Ship `deploy/kubernetes/`: a Helm chart + docs page + E2E validation on one
+managed cloud**, following the existing backend conventions.
+
+Suggested PR scope:
+
+```
+deploy/kubernetes/
+├── README.md                     # quickstart + per-cloud node-pool one-liners
+└── chart/                        # helm chart "tuft"
+    ├── Chart.yaml
+    ├── values.yaml
+    └── templates/
+        ├── deployment.yaml       # replicas: 1 enforced, strategy: Recreate,
+        │                         #   nvidia.com/gpu resources, /dev/shm emptyDir
+        │                         #   (medium: Memory, sizeLimit), startupProbe on
+        │                         #   /api/v1/healthz, GPU tolerations/nodeSelector
+        ├── config-secret.yaml    # full tuft_config.yaml as a Secret (it embeds
+        │                         #   the tml- API keys), or existingSecret ref
+        ├── pvc.yaml              # /data (HF cache + checkpoints), RWO
+        ├── service.yaml          # ClusterIP default; LoadBalancer optional
+        ├── ingress.yaml          # optional
+        └── NOTES.txt             # port-forward + Tinker connect snippet
+docs/sphinx_doc/source/deployment/kubernetes.md   # same Yoda walkthrough
+```
+
+Key `values.yaml` knobs: `image`, `gpuCount`, `shmSize`, `resources`
+(memory limit must cover shm + process RSS), `config` (inline tuft_config) /
+`existingConfigSecret`, `hfTokenSecret`, `persistence.{size,storageClass}`,
+`service.type`, `ingress.*`, `redis.url`, `nodeSelector`/`tolerations`
+(GPU taints differ per cloud), `runtimeClassName`.
+
+Acceptance criteria (mirrors `deploy-e2e.yml`):
+
+1. `helm lint` + `helm template` golden test in the normal CI (no cluster
+   needed).
+2. Manual E2E on one managed cluster: install with `Qwen/Qwen3-0.6B` on an
+   L4/A10-class node, `/api/v1/healthz` gates green, `get_server_capabilities`
+   answers, Yoda SFT run completes, `helm uninstall` + node pool teardown.
+   Later: add a `k8s` option to `deploy-e2e.yml` (needs cluster credentials as
+   repo secrets).
+3. Docs guide reaches parity with the Modal/Lambda pages.
+
+Which cloud to validate first is a maintainer call: **ACK** serves the core
+audience and is the coverage gap everything else misses; **GKE Autopilot** or
+**EKS Auto Mode** are the lowest-friction validation targets (drivers + device
+plugin fully managed, per-pod GPU provisioning). Validating on one + smoke
+docs for the others is enough for a first PR.
+
+Explicit non-goals for v1 (so reviewers don't have to re-litigate): no
+operator/CRD (KubeAI/KAITO territory — later, if ever), no SkyServe (beta),
+no scale-to-zero on K8s (users who want that have Modal), no managed inference
+platforms (§6), no multi-node (KubeRay comes with the distributed-training
+milestone — just keep the pod spec reusable as a future head-pod template).
+
+Follow-on sequence after the chart lands:
+
+1. Per-cloud quickstart guides: ACK + EKS, then GKE + AKS (thin, validated).
+2. `deploy/sky/` SkyPilot task YAML + helper (covers the VM path on
+   AWS/GCP/Azure/Lambda/RunPod/… in one file; document the
+   `ray.init(address="auto")` prohibition and `--shm-size` run option).
+3. PAI-EAS deployment guide (docs-only; best managed fit, China audience).
+4. Opportunistic: Beam / RunPod Pods helpers if user demand shows up.
+
+### Open questions for the RFC discussion
+
+- First validation cloud: ACK (audience, coverage gap) vs GKE/EKS (friction)?
+- Publish the chart to `ghcr.io/agentscope-ai` as an OCI artifact alongside
+  the image?
+- Config secret shape: whole `tuft_config.yaml` as one Secret (simple, matches
+  the "one portable file" convention) vs splitting API keys into env vars?
+- SkyPilot vs dstack for phase 2 (default lean: SkyPilot — Apache-2.0, larger
+  community — despite the internal-Ray caveat; dstack's `service` + `shm_size`
+  ergonomics are the counterargument).
+
