@@ -76,7 +76,92 @@ For each option we ask:
    core part of the user base (the Dockerfile already carries Alibaba PyPI and
    HF mirror hooks).
 
-<!-- TODO: section 4 — Kubernetes path (agent B) -->
+## 4. Option A — Kubernetes first (the common denominator)
+
+All four roadmap clouds sell managed Kubernetes — **EKS** (AWS), **GKE** (GCP),
+**AKS** (Azure), **ACK** (Alibaba) — and it is the *only* substrate that covers
+all four (plus on-prem GPU clusters) with a single artifact. TuFT's contract
+maps onto small, boring K8s primitives:
+
+| Contract item | K8s realization |
+|---|---|
+| One stateful replica | `Deployment` with `strategy: Recreate` (old pod releases the GPU + RWO PVC before the new one starts) — or a 1-replica StatefulSet; prior-art LLM charts use Deployments |
+| GPUs | `resources.limits: {nvidia.com/gpu: N}` via the NVIDIA device plugin; the GPU Operator is only needed on self-managed nodes (managed clouds preinstall drivers — see below) |
+| Big `/dev/shm` | pods default to 64Mi shm → mount `emptyDir: {medium: Memory, sizeLimit: 64Gi}` at `/dev/shm`; tmpfs counts against the container memory limit, so size limits ≥ shm + RSS |
+| `/data` volume | RWO PVC, `volumeBindingMode: WaitForFirstConsumer`; default storage classes exist on all four clouds (EBS gp3 / PD-Hyperdisk / Azure Disk / Alibaba cloud disk) |
+| Slow startup (model load) | `startupProbe` on `/api/v1/healthz` with a large budget (e.g. `periodSeconds: 15, failureThreshold: 60` ≈ 15 min), then readiness + conservative liveness |
+| Secrets | `Secret` env refs for `HF_TOKEN` + API keys, `existingSecret` support in values; External Secrets Operator for cloud secret managers later |
+| Exposure | ClusterIP + Ingress or `type: LoadBalancer`; `kubectl port-forward` for the SSH-tunnel-style dev flow the Lambda guide already teaches |
+| Optional Redis persistence | standard Redis subchart / managed Redis endpoint in `persistence.redis_url` |
+
+Sources: [k8s emptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir),
+[Deployment strategy](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#strategy),
+[probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/),
+[NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/index.html).
+
+### Managed K8s GPU state per cloud (verified 2026-07)
+
+- **EKS**: Auto Mode bundles managed Karpenter — a `nvidia.com/gpu` request
+  auto-provisions GPU nodes on Bottlerocket accelerated AMIs (driver, runtime,
+  device plugin preinstalled). On non-Auto clusters, AL2023 accelerated AMIs
+  ship the driver but **not** the device plugin (install it or the Operator).
+  ([AWS](https://docs.aws.amazon.com/eks/latest/userguide/ml-node-pools.html))
+- **GKE**: Standard node pools auto-install drivers + plugin; **Autopilot**
+  runs GPU pods fully managed (B200/H200/H100/A100/L4/T4 via
+  `cloud.google.com/gke-accelerator` selector). Dynamic Workload Scheduler
+  *flex-start* gives discounted on-demand GPU capacity for runs up to 7 days.
+  ([GKE Autopilot GPUs](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/autopilot-gpus),
+  [DWS](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/dws))
+- **AKS**: the recommended path is now AKS-**managed GPU node pools** (AKS owns
+  driver/plugin/DCGM). Azure also ships **KAITO** (AI toolchain operator
+  add-on, CNCF sandbox) that auto-provisions right-sized GPU nodes from a
+  Workspace CRD — prior art worth imitating, not a dependency.
+  ([MS Learn](https://learn.microsoft.com/en-us/azure/aks/use-nvidia-gpu),
+  [KAITO](https://github.com/kaito-project/kaito))
+- **Alibaba ACK**: GPU node pools via `ack-ai-installer`; **cGPU** kernel-level
+  GPU sharing (memory isolation, ACK Pro) is unique among the four clouds and
+  aligns with the "serverless GPU / multi-tenant sharing" roadmap item. ACS
+  (successor of ACK Serverless) documents serverless GPU pods (48/96/141 GB
+  cards), though GPU compute there still appears to be invitational preview
+  (GA status unverified).
+  ([cGPU](https://www.alibabacloud.com/help/en/ack/ack-managed-and-ack-dedicated/user-guide/cgpu-overview/),
+  [ACS pods](https://www.alibabacloud.com/help/en/cs/user-guide/acs-pod-instance-overview))
+
+### Prior art for the chart
+
+- [vLLM production-stack](https://github.com/vllm-project/production-stack):
+  values-driven per-model Deployment + Service + PVC — good template for GPU /
+  HF-token / PVC knobs.
+- [otwld/ollama-helm](https://github.com/otwld/ollama-helm): community chart
+  closest to TuFT's shape (single Deployment + PVC + GPU toggle + model
+  bootstrap).
+- [KubeAI](https://github.com/substratusai/kubeai) (operator + Model CRD,
+  scale-from-zero) and [KAITO](https://github.com/kaito-project/kaito)
+  (CRD auto-provisions GPU nodes): patterns for a *later* TuFT operator;
+  overkill for v1. [llm-d](https://llm-d.ai) targets disaggregated inference
+  gateways — not our shape.
+
+### Multi-node later (ties into the distributed-training roadmap item)
+
+TuFT starts Ray in-process today, so plain K8s suffices now. When multi-machine
+training lands, [KubeRay](https://docs.ray.io/en/latest/cluster/kubernetes/index.html)
+(mature; RayCluster/RayJob/RayService CRDs) is the natural fit — a `RayCluster`
+with the TuFT server as head-pod entrypoint. (RayService targets Ray Serve
+apps, not FastAPI+actors.) [LWS](https://github.com/kubernetes-sigs/lws) is an
+alternative if only engines span nodes; Kueue matters only for shared-quota
+queueing; JobSet is batch-shaped and irrelevant for an always-on server. A v1
+chart should not depend on any of these — just not paint itself into a corner
+(e.g., keep the server pod spec reusable as a head-pod template).
+
+### GPU sharing (serverless-GPU roadmap item)
+
+Node-level sharing — time-slicing (no isolation), MPS (fraction enforcement,
+fragile), MIG (hardware isolation, A100/H100+), Alibaba cGPU — is configured
+via device-plugin/Operator config, orthogonal to the chart. TuFT already packs
+tenants *inside* one process, so node-level sharing mainly helps carve big
+GPUs into multiple small TuFT instances, or co-locate TuFT with other
+workloads (MIG safest). K8s DRA (GA in v1.34) is the forward-looking API here.
+([NVIDIA GPU sharing](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html))
 
 ## 5. Option B — Multi-cloud launchers (SkyPilot, dstack)
 
@@ -131,6 +216,34 @@ Lambda, RunPod, Nebius, …) in one shot, but **Alibaba Cloud is reachable only
 through the Kubernetes backend (i.e., ACK)** or a bespoke integration.
 
 <!-- TODO: section 6 — per-cloud native options (agent C) -->
-<!-- TODO: section 7 — other GPU clouds (agent D) -->
+## 7. The rest of the GPU-cloud landscape (secondary)
+
+Not roadmap targets, but users keep asking for "the Modal/Lambda of X".
+Verified verdicts (2026-07-18) on whether each could run TuFT's stateful
+long-session server:
+
+**Modal-like serverless platforms:**
+
+| Provider | Verdict | Why |
+|---|---|---|
+| [Beam](https://docs.beam.cloud/v2/pod/web-service) | ✅ closest Modal analog | Pods run arbitrary images with exposed ports, persistent Volumes, persistent HTTPS endpoints; open-source backend |
+| [Cerebrium](https://docs.cerebrium.ai/cerebrium/storage/managing-files) | ⚠️ partial | custom Dockerfile + 50 GB persistent storage, but request-driven autoscaling; long-session tolerance unverified |
+| [Koyeb GPU](https://www.koyeb.com/docs/reference/volumes) | ⚠️ partial | always-on GPU services with scale-to-zero, but volumes are preview-only, 10 GB max |
+| RunPod Serverless | ❌ | queue-based request/response workers, 24 h cap — fights a stateful server |
+| Baseten | ❌ | inference-shaped custom servers, no persistent volume |
+| Replicate | ❌ | Cog predict/train API only, no arbitrary web server |
+
+**Lambda-like on-demand GPU capacity:** RunPod **Pods** (REST API launches a
+*container* directly — the docker-run pattern with no cloud-init needed),
+Nebius, Crusoe, Vast.ai, Vultr, Hyperstack, DigitalOcean GPU Droplets, OVHcloud
+all fit the Lambda script pattern. CoreWeave is Kubernetes-native (CKS) — it
+belongs to the Helm path, not a VM script.
+
+**Coverage shortcut:** SkyPilot and/or dstack already cover RunPod, Nebius,
+Crusoe, Vast.ai, Vultr, DigitalOcean/Paperspace, CoreWeave, Lambda and more —
+so one launcher integration reaches nearly all of these without TuFT owning
+any per-provider code. Only Beam (Modal-pattern) and RunPod Pods would justify
+small dedicated helpers if user demand shows up; Hyperstack/OVHcloud are
+covered by neither launcher and are not worth bespoke scripts today.
 <!-- TODO: section 8 — comparison + recommendation -->
 <!-- TODO: section 9 — proposed next step, PR scope, open questions -->
