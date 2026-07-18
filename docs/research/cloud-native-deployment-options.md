@@ -76,4 +76,61 @@ For each option we ask:
    core part of the user base (the Dockerfile already carries Alibaba PyPI and
    HF mirror hooks).
 
-<!-- RESEARCH SECTIONS TO BE FILLED FROM WEB RESEARCH -->
+<!-- TODO: section 4 — Kubernetes path (agent B) -->
+
+## 5. Option B — Multi-cloud launchers (SkyPilot, dstack)
+
+These frameworks let one YAML target many clouds, replacing N per-cloud
+scripts with one integration. Verified state as of 2026-07-18:
+
+| | SkyPilot v0.13 | dstack 0.20 |
+|---|---|---|
+| AWS / GCP / Azure | ✅ / ✅ / ✅ | ✅ / ✅ / ✅ |
+| **Alibaba Cloud** | ❌ (not supported) | ❌ (not supported) |
+| Lambda Cloud | ✅ | ✅ |
+| Kubernetes | ✅ | ✅ |
+| Other infra | OCI, Nebius, Crusoe, CoreWeave, RunPod, Vast.ai, DigitalOcean, Paperspace, Slurm, vSphere, … | OCI, Nebius, Crusoe, Vultr, RunPod, Vast.ai, Slurm, on-prem SSH fleets, … |
+| License / community | Apache-2.0, ~10.3k stars | MPL-2.0, ~2.2k stars |
+| Persistent volumes | K8s-native `volumes`; on VM clouds only bucket `file_mounts` or the stopped VM's disk | Network volumes on AWS/GCP/RunPod/K8s only (not Azure/Lambda); instance volumes elsewhere |
+| Service exposure | `resources.ports` opens firewall + endpoint | `type: service` + `port`, optional gateway for HTTPS, token auth built in |
+| Scale-to-zero | VM autostop; SkyServe `min_replicas: 0` exists but SkyServe is beta, not recommended for production | `replicas: 0..N` + RPS-based autoscaling (needs gateway) |
+| `--shm-size` | via `docker.run_options: [--shm-size=128g]` | first-class `resources.shm_size` field |
+
+Sources: [SkyPilot supported infra](https://docs.skypilot.co/en/latest/getting-started/installation.html),
+[SkyPilot YAML spec](https://docs.skypilot.co/en/latest/reference/yaml-spec.html),
+[dstack backends](https://dstack.ai/docs/concepts/backends/),
+[dstack services](https://dstack.ai/docs/concepts/services/),
+[dstack volumes](https://dstack.ai/docs/concepts/volumes/).
+
+**SkyPilot caveats specific to TuFT:**
+
+- **Ray conflict (real risk, manageable).** SkyPilot runs its own internal Ray
+  (port 6380) on every node it provisions. Apps may run their own Ray, but must
+  never call `ray.init(address="auto")` (would join SkyPilot's cluster) and
+  never `ray stop`. TuFT's in-process `ray.init()` is compatible as long as we
+  document/guard this.
+  ([SkyPilot FAQ](https://docs.skypilot.co/en/latest/reference/faq.html),
+  [Ray-on-SkyPilot example](https://docs.skypilot.co/en/stable/examples/training/ray.html))
+- **Durability.** No cross-cloud block-volume abstraction: on VM clouds, /data
+  persistence means bucket mounts (`MOUNT_CACHED` for checkpoints) or relying
+  on autostop-*stop* (not down) keeping the disk.
+- SkyPilot is now a client-server system (background local API server) — one
+  more moving part in a deploy helper, but also enables team deployments.
+
+**dstack notes:** the `type: service` concept maps almost 1:1 onto TuFT's
+contract (image, port, replicas: 1, volume, HTTP probe on `/api/v1/healthz`,
+built-in token auth in front of TuFT's own keys), and `shm_size` is first-class.
+Smaller community; volume gaps on Azure/Lambda.
+
+**Ray's own cluster launcher** has a community-maintained Aliyun backend, but it
+provisions bare Ray clusters — architecturally colliding with TuFT's in-process
+Ray — and doesn't manage services/volumes/ports as a product. Poor fit.
+
+**Key structural fact:** a launcher integration covers AWS + GCP + Azure (+
+Lambda, RunPod, Nebius, …) in one shot, but **Alibaba Cloud is reachable only
+through the Kubernetes backend (i.e., ACK)** or a bespoke integration.
+
+<!-- TODO: section 6 — per-cloud native options (agent C) -->
+<!-- TODO: section 7 — other GPU clouds (agent D) -->
+<!-- TODO: section 8 — comparison + recommendation -->
+<!-- TODO: section 9 — proposed next step, PR scope, open questions -->
