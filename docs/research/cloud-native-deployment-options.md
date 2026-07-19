@@ -151,15 +151,42 @@ Sources: [k8s emptyDir](https://kubernetes.io/docs/concepts/storage/volumes/#emp
 
 ### Multi-node later (ties into the distributed-training roadmap item)
 
-TuFT starts Ray in-process today, so plain K8s suffices now. When multi-machine
-training lands, [KubeRay](https://docs.ray.io/en/latest/cluster/kubernetes/index.html)
-(mature; RayCluster/RayJob/RayService CRDs) is the natural fit — a `RayCluster`
-with the TuFT server as head-pod entrypoint. (RayService targets Ray Serve
-apps, not FastAPI+actors.) [LWS](https://github.com/kubernetes-sigs/lws) is an
-alternative if only engines span nodes; Kueue matters only for shared-quota
-queueing; JobSet is batch-shaped and irrelevant for an always-on server. A v1
-chart should not depend on any of these — just not paint itself into a corner
-(e.g., keep the server pod spec reusable as a head-pod template).
+TuFT starts Ray in-process today, so plain K8s suffices now.
+
+**Design direction (2026-07): multi-node means scaling out whole models, not
+sharding one model across nodes.** Each model's training/sampling actor group
+stays within a single node (intra-node TP/FSDP); the fleet grows by adding
+nodes that host more models, replicas, and tenants. This buys a lot:
+
+- **No cross-node collectives** → no RDMA/EFA/InfiniBand node pools, no NCCL
+  over the network, no gang-scheduling of tightly coupled pod groups. Plain
+  GPU nodes on any cloud qualify — wider provider coverage, no interconnect
+  price premium.
+- **No [LWS](https://github.com/kubernetes-sigs/lws).** LeaderWorkerSet exists
+  precisely for cross-node sharded serving; it drops out of the picture.
+- **Failure isolation.** Losing a node takes out only the models on it;
+  recovery is checkpoint reload + (optional) Redis state, not a distributed
+  restart.
+
+The codebase is already mostly aligned: each vLLM engine is a single Ray actor
+requesting its full `tensor_parallel_size` in GPUs (`src/tuft/backends/
+sampling_backend.py`) — and a single actor cannot span nodes — while FSDP
+training workers are per-GPU actors (`fsdp_training_backend.py`) that today
+land on the local node. On a multi-node Ray cluster the only new requirement
+is pinning each model's worker group to one node, which is exactly Ray's
+placement-group `STRICT_PACK` strategy
+([Ray docs](https://docs.ray.io/en/latest/ray-core/scheduling/placement-group.html)).
+
+[KubeRay](https://docs.ray.io/en/latest/cluster/kubernetes/index.html)
+(mature; RayCluster/RayJob/RayService CRDs) remains the natural K8s substrate:
+a `RayCluster` with the TuFT server as head-pod entrypoint and plain GPU
+worker nodes. (RayService targets Ray Serve apps, not FastAPI+actors.) Kueue
+matters only for shared-quota queueing; JobSet is batch-shaped and irrelevant
+for an always-on server. The accepted trade-off: the largest supported base
+model is bounded by the biggest single node (8×H100/H200 ≈ 640 GB–1.1 TB HBM —
+comfortable for LoRA post-training through the ~70B class). A v1 chart should
+not depend on any of this — just keep the server pod spec reusable as a
+future head-pod template.
 
 ### GPU sharing (serverless-GPU roadmap item)
 
@@ -384,8 +411,10 @@ docs for the others is enough for a first PR.
 Explicit non-goals for v1 (so reviewers don't have to re-litigate): no
 operator/CRD (KubeAI/KAITO territory — later, if ever), no SkyServe (beta),
 no scale-to-zero on K8s (users who want that have Modal), no managed inference
-platforms (§6), no multi-node (KubeRay comes with the distributed-training
-milestone — just keep the pod spec reusable as a future head-pod template).
+platforms (§6), no multi-node yet — and when multi-node lands, the direction
+is scale-out of whole models (one model ≤ one node, §4), so the chart never
+needs LWS or RDMA-enabled node pools; just keep the pod spec reusable as a
+future head-pod template.
 
 Follow-on sequence after the chart lands:
 
