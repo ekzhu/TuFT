@@ -216,7 +216,7 @@ We recommend using [uv](https://github.com/astral-sh/uv) for dependency manageme
     cd TuFT
     bash scripts/env_check.sh
     ```
-    This script will assess your environment status and suggest possible solutions.
+    This script will assess your environment status and suggest possible solutions. For the full list of mirror settings (`UV_PYTHON_INSTALL_MIRROR`, `UV_INDEX`, `HF_ENDPOINT`) and which step each one unblocks, see [Restricted Network Environments](https://agentscope-ai.github.io/TuFT/en/latest/getting-started/installation.html#restricted-network-environments) in the docs.
 
 2. Create a virtual environment:
 

@@ -11,6 +11,13 @@
 参阅 **[部署指南](../deployment/index.md)**。
 ```
 
+```{admonition} 🌐 网络受限？
+:class: tip
+
+安装 TuFT 需要访问 GitHub、PyPI 和 Hugging Face。如果其中任何一个访问缓慢或不可达，
+请参阅 **[网络受限环境](#restricted-network-environments)**，其中提供了诊断脚本和相应的镜像配置。
+```
+
 ## 快速安装
 
 > **注意**：此脚本支持 Unix 平台。其他平台请参阅下面的手动安装部分。
@@ -110,6 +117,54 @@ uv pip install "tuft[dev,backend,persistence]>=0.1.8"
         ├── Qwen3-8B/
         └── tuft_config.yaml
     ```
+
+(restricted-network-environments)=
+## 网络受限环境
+
+TuFT 在安装和运行时都依赖 GitHub、PyPI 和 Hugging Face。如果其中任何一个访问缓慢或不可达，
+请先运行仓库自带的诊断脚本，而不是手动排查：
+
+```bash
+cd TuFT
+bash scripts/env_check.sh
+```
+
+该脚本会测量 TuFT 所需各个服务的延迟和下载速度，并针对失败的服务打印出可直接复制粘贴的镜像配置。
+脚本检查的内容以及每项失败会阻塞的步骤：
+
+| 失败的步骤 | 受阻的服务 | 解决方式 |
+| --- | --- | --- |
+| 安装 `uv` | GitHub releases | 从 PyPI 安装 `uv`，而不是使用 `curl` 安装脚本 |
+| `uv venv --python 3.12` | GitHub 上的 python-build-standalone | 设置 `UV_PYTHON_INSTALL_MIRROR` |
+| `uv sync` | PyPI | 设置 `UV_INDEX` |
+| 启动服务器、加载模型或数据集 | Hugging Face | 设置 `HF_ENDPOINT` |
+
+下面的命令使用中国大陆可访问的镜像。如果你有内部镜像源，请替换为自己的地址。
+
+```bash
+# 1. 当 github.com 不可达时，从 PyPI 安装 uv
+python -m pip install -U pip
+pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+pip install -U uv
+
+# 2. `uv venv --python` 下载独立 Python 构建时使用的镜像
+export UV_PYTHON_INSTALL_MIRROR=https://python-standalone.org/mirror/astral-sh/python-build-standalone
+
+# 3. `uv sync` 和 `uv pip install` 使用的包索引
+export UV_INDEX=https://mirrors.aliyun.com/pypi/simple/
+
+# 4. 下载模型和数据集使用的端点
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+把这些 `export` 语句写入 `~/.bashrc` 或 `~/.zshrc` 即可在所有 shell 中生效。`HF_ENDPOINT`
+必须在发起下载的进程启动之前设置：在 `tuft launch` 之前 export；在 notebook 中则在第一个单元格里设置
+（`os.environ["HF_ENDPOINT"] = ...`）并重启内核。
+
+其他安装方式同样适用这些配置。运行[快速安装](#快速安装)脚本前先 export 这些变量——该脚本底层调用 `uv`，
+并且在 `curl` 安装器无法访问 astral.sh 时会自动回退到 `pip install uv`；但请注意，下载 `install.sh`
+本身仍然需要访问 `raw.githubusercontent.com`。`docker/Dockerfile` 和
+`src/tuft/console/docker/Dockerfile` 中也提供了同样变量的注释行 `ENV`——构建自己的镜像前取消注释即可。
 
 ## 运行服务器
 

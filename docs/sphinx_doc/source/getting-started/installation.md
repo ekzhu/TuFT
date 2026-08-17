@@ -11,6 +11,15 @@ scale-to-zero) or **[Lambda Cloud](../deployment/lambda.md)** — and fine-tune 
 laptop. See the **[Deployment guides](../deployment/index.md)**.
 ```
 
+```{admonition} 🌐 Restricted network?
+:class: tip
+
+Installing TuFT pulls from GitHub, PyPI and Hugging Face. If any of them are slow or
+unreachable from your network, see
+**[Restricted Network Environments](#restricted-network-environments)** for the diagnostic
+script and the mirror settings to apply.
+```
+
 ## Quick Install
 
 > **Note**: This script supports unix platforms. For other platforms, see the manual installation sections below.
@@ -110,6 +119,59 @@ If you face issues with local installation or want to get started quickly, you c
         ├── Qwen3-8B/
         └── tuft_config.yaml
     ```
+
+## Restricted Network Environments
+
+TuFT depends on GitHub, PyPI and Hugging Face both while installing and at runtime. If any
+of them are slow or unreachable, run the bundled diagnostic script before troubleshooting by
+hand:
+
+```bash
+cd TuFT
+bash scripts/env_check.sh
+```
+
+The script measures latency and download speed for each endpoint TuFT needs, then prints the
+mirror settings for whichever ones are failing, ready to copy and paste. What it checks, and
+what each failure blocks:
+
+| Failing step | Blocked endpoint | Fix |
+| --- | --- | --- |
+| Installing `uv` | GitHub releases | Install `uv` from PyPI instead of the `curl` installer |
+| `uv venv --python 3.12` | python-build-standalone on GitHub | Set `UV_PYTHON_INSTALL_MIRROR` |
+| `uv sync` | PyPI | Set `UV_INDEX` |
+| Starting the server, loading models or datasets | Hugging Face | Set `HF_ENDPOINT` |
+
+The commands below use mirrors reachable from mainland China. Substitute your own if you run
+an internal mirror.
+
+```bash
+# 1. Install uv from PyPI when github.com is unreachable
+python -m pip install -U pip
+pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+pip install -U uv
+
+# 2. Mirror for the standalone Python builds that `uv venv --python` downloads
+export UV_PYTHON_INSTALL_MIRROR=https://python-standalone.org/mirror/astral-sh/python-build-standalone
+
+# 3. Package index used by `uv sync` and `uv pip install`
+export UV_INDEX=https://mirrors.aliyun.com/pypi/simple/
+
+# 4. Endpoint used for model and dataset downloads
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+Add the `export` lines to `~/.bashrc` or `~/.zshrc` to keep them across shells. `HF_ENDPOINT`
+has to be set before the process that downloads anything starts — export it before
+`tuft launch`, and in a notebook set it in the first cell (`os.environ["HF_ENDPOINT"] = ...`)
+and restart the kernel.
+
+The same settings apply to the other install paths. Export them before running the
+[Quick Install](#quick-install) script — it drives `uv` under the hood, and already falls
+back to `pip install uv` when the `curl` installer cannot reach astral.sh — but note that
+fetching `install.sh` itself still needs `raw.githubusercontent.com`. Both
+`docker/Dockerfile` and `src/tuft/console/docker/Dockerfile` carry the same variables as
+commented-out `ENV` lines; uncomment them before building your own image.
 
 ## Run the Server
 
