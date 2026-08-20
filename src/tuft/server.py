@@ -29,7 +29,7 @@ from .config import AppConfig
 from .exceptions import ServerException, TuFTException
 from .oai import create_oai_router
 from .persistence import get_redis_store, save_config_signature
-from .state import ServerState
+from .state import ServerCapabilitiesResponse, ServerState
 from .telemetry import shutdown_telemetry
 
 
@@ -146,12 +146,12 @@ def create_root_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.get(
         "/api/v1/get_server_capabilities",
-        response_model=types.GetServerCapabilitiesResponse,
+        response_model=ServerCapabilitiesResponse,
     )
     async def get_server_capabilities(
         state: ServerState = Depends(_get_state),
-    ) -> types.GetServerCapabilitiesResponse:
-        return types.GetServerCapabilitiesResponse(supported_models=state.build_supported_models())
+    ) -> ServerCapabilitiesResponse:
+        return ServerCapabilitiesResponse(supported_models=state.build_supported_models())
 
     @app.post(
         "/api/v1/create_session",
